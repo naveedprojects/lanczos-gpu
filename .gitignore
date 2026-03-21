@@ -1,0 +1,11 @@
+build/
+data/
+*.o
+*.so
+*.pyc
+__pycache__/
+*.egg-info/
+python/build/
+*.pdf
+research_analysis.md
+.claude/
