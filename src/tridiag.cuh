@@ -137,12 +137,17 @@ inline void apply_shifts_tridiag(double *d, double *e, int m,
 // ============================================================
 inline int solve_tridiag(const double *alpha, const double *beta, int m,
                          double *eig_d, double *eig_z) {
-    double *eig_e = (double *)malloc(m * sizeof(double));
-    double *work  = (double *)malloc(2 * m * sizeof(double));
+    // LAPACK dstev: WORK dim max(1, 2*N-2). Use calloc and overallocate.
+    int lwork = (m > 1) ? (4 * m + 16) : 16;
+    double *eig_e = (double *)calloc(m + 16, sizeof(double));
+    double *work  = (double *)calloc(lwork, sizeof(double));
 
     memcpy(eig_d, alpha, m * sizeof(double));
     for (int i = 0; i < m - 1; i++)
         eig_e[i] = beta[i + 1];
+
+    // Zero-initialize eig_z to avoid any chance of stale data being read.
+    memset(eig_z, 0, (size_t)m * m * sizeof(double));
 
     int info;
     char jobz = 'V';

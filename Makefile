@@ -13,7 +13,8 @@ SOURCES = $(SRC_DIR)/main.cu $(SRC_DIR)/naive_lanczos.cu \
           $(SRC_DIR)/dgks_lanczos.cu $(SRC_DIR)/irlm_lanczos.cu \
           $(SRC_DIR)/cast_kernels.cu
 HEADERS = $(SRC_DIR)/lanczos_types.cuh $(SRC_DIR)/lanczos_context.cuh \
-          $(SRC_DIR)/lanczos_ops.cuh $(SRC_DIR)/tridiag.cuh
+          $(SRC_DIR)/lanczos_ops.cuh $(SRC_DIR)/tridiag.cuh \
+          $(SRC_DIR)/matvec_operator.cuh $(SRC_DIR)/inner_solve.cuh
 TARGET = $(BUILD_DIR)/lanczos_bench
 
 .PHONY: all clean run bench ref plot

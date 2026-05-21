@@ -68,29 +68,37 @@ class BuildExt(build_ext):
             subprocess.check_call(cmd)
             cpp_objects.append(obj)
 
-        # Link everything into shared library
-        all_objects = cu_objects + cpp_objects
-        # Also need irlm_lanczos.cu compiled
-        irlm_src = os.path.join(SRC_DIR, 'irlm_lanczos.cu')
-        irlm_obj = os.path.join(self.build_temp or '.', 'irlm_lanczos.o')
-        os.makedirs(os.path.dirname(irlm_obj) or '.', exist_ok=True)
-        cmd = [
-            f'{CUDA_HOME}/bin/nvcc',
-            '-O3', '-arch=sm_86', '-std=c++17',
-            '--compiler-options', '-fPIC',
-            '-I', SRC_DIR,
-            '-c', irlm_src, '-o', irlm_obj,
+        # Compile CUDA source files from src/
+        src_cu_files = [
+            os.path.join(SRC_DIR, 'irlm_lanczos.cu'),
+            os.path.join(SRC_DIR, 'cast_kernels.cu'),
         ]
-        print(' '.join(cmd))
-        subprocess.check_call(cmd)
-        all_objects.append(irlm_obj)
+        src_objects = []
+        build_tmp = self.build_temp or '.'
+        os.makedirs(build_tmp, exist_ok=True)
+        for src in src_cu_files:
+            basename = os.path.splitext(os.path.basename(src))[0]
+            obj = os.path.join(build_tmp, f'{basename}.o')
+            cmd = [
+                f'{CUDA_HOME}/bin/nvcc',
+                '-O3', '-arch=sm_86', '-std=c++17',
+                '--compiler-options', '-fPIC',
+                '-I', SRC_DIR,
+                '-c', src, '-o', obj,
+            ]
+            print(' '.join(cmd))
+            subprocess.check_call(cmd)
+            src_objects.append(obj)
 
+        # Link everything into shared library
+        all_objects = cu_objects + cpp_objects + src_objects
         link_cmd = [
             'g++', '-shared', '-o', ext_path,
         ] + all_objects + [
             f'-L{CUDA_HOME}/lib64',
             '-lcudart', '-lcusparse', '-lcublas', '-lcusolver',
             '-llapack', '-lblas',
+            '-ldl',
         ]
         print(' '.join(link_cmd))
         subprocess.check_call(link_cmd)
@@ -98,19 +106,24 @@ class BuildExt(build_ext):
 
 setup(
     name='gpu_eigsh',
-    version='0.1.0',
-    description='GPU-accelerated sparse eigenvalue solver (ARPACK-quality IRLM on CUDA)',
+    version='0.2.0',
+    description='GPU-accelerated differentiable sparse eigenvalue solver '
+                '(ARPACK-quality IRLM on CUDA with implicit differentiation)',
     packages=['gpu_eigsh'],
     ext_modules=[
         CUDAExtension(
             'gpu_eigsh._core',
             sources=[
                 'gpu_eigsh/_cuda_eigsh.cu',
+                'gpu_eigsh/_cuda_funm.cu',
                 'gpu_eigsh/_bindings.cpp',
             ],
         ),
     ],
     cmdclass={'build_ext': BuildExt},
     install_requires=['numpy', 'scipy'],
+    extras_require={
+        'torch': ['torch'],
+    },
     python_requires='>=3.8',
 )

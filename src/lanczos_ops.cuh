@@ -336,3 +336,129 @@ inline void compute_ritz_vectors(LanczosContext &ctx,
     cudaFree(d_S);
     cudaFree(d_X);
 }
+
+// ============================================================
+// Rayleigh-Ritz refinement of Ritz vectors.
+//
+// Given approximate eigenvectors X (n x k, column-major on host)
+// and the matrix operator, refine by:
+//   1. AX = A * X         (k SpMVs via GEMM)
+//   2. H  = X^T * AX      (k x k Rayleigh quotient)
+//   3. H  = U D U^T       (eigendecompose, LAPACK dsyev)
+//   4. X' = X * U          (rotate to refined basis)
+//   5. eigenvalues = D
+//
+// This ensures:
+//   - Eigenvectors are exactly orthonormal (from U^T U = I)
+//   - Eigenvalues are optimal Rayleigh quotients
+//   - Residuals ||AX' - X'D|| are minimized within span(X)
+//
+// Cost: k SpMVs + O(n k^2) GEMM + O(k^3) dsyev.
+// For k << n, this is negligible compared to the IRLM iteration.
+// ============================================================
+extern "C" void dsyev_(const char *jobz, const char *uplo, const int *n,
+                       double *a, const int *lda, double *w,
+                       double *work, const int *lwork, int *info);
+
+// Forward declaration: MatVecOperator is defined in matvec_operator.cuh
+// but this header is included before it. We use a function pointer instead.
+inline void rayleigh_ritz_refine(LanczosContext &ctx,
+                                 SparseMatrixCSR &A,
+                                 double *h_eigenvalues, double *h_eigenvectors,
+                                 int n, int k) {
+    double one = 1.0, zero = 0.0;
+
+    // Upload X to device
+    double *d_X, *d_AX;
+    CUDA_CHECK(cudaMalloc(&d_X,  (size_t)n * k * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_AX, (size_t)n * k * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_X, h_eigenvectors, (size_t)n * k * sizeof(double),
+        cudaMemcpyHostToDevice));
+
+    // AX = A * X  (k SpMVs as a single SpMM-like operation via column loop)
+    for (int j = 0; j < k; j++) {
+        double *d_xj  = d_X  + (size_t)j * n;
+        double *d_axj = d_AX + (size_t)j * n;
+
+        CUSPARSE_CHECK(cusparseDnVecSetValues(ctx.vec_x, (void *)d_xj));
+        CUSPARSE_CHECK(cusparseDnVecSetValues(ctx.vec_y, d_axj));
+
+        size_t needed = 0;
+        CUSPARSE_CHECK(cusparseSpMV_bufferSize(ctx.cusparse,
+            CUSPARSE_OPERATION_NON_TRANSPOSE, &one, A.descr, ctx.vec_x,
+            &zero, ctx.vec_y, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT, &needed));
+
+        if (needed > ctx.spmv_buffer_size) {
+            if (ctx.spmv_buffer) cudaFree(ctx.spmv_buffer);
+            CUDA_CHECK(cudaMalloc(&ctx.spmv_buffer, needed));
+            ctx.spmv_buffer_size = needed;
+        }
+
+        CUSPARSE_CHECK(cusparseSpMV(ctx.cusparse,
+            CUSPARSE_OPERATION_NON_TRANSPOSE, &one, A.descr, ctx.vec_x,
+            &zero, ctx.vec_y, CUDA_R_64F, CUSPARSE_SPMV_ALG_DEFAULT,
+            ctx.spmv_buffer));
+    }
+
+    // H = X^T * AX  (k x k on device)
+    double *d_H;
+    CUDA_CHECK(cudaMalloc(&d_H, (size_t)k * k * sizeof(double)));
+    CUBLAS_CHECK(cublasDgemm(ctx.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        k, k, n, &one, d_X, n, d_AX, n, &zero, d_H, k));
+
+    // Download H to host for LAPACK dsyev
+    std::vector<double> H(k * k);
+    CUDA_CHECK(cudaMemcpy(H.data(), d_H, k * k * sizeof(double),
+        cudaMemcpyDeviceToHost));
+    cudaFree(d_H);
+
+    // Eigendecompose H = U D U^T
+    std::vector<double> w(k);
+    int lwork = -1;
+    double work_query;
+    int info;
+    char jobz = 'V', uplo = 'U';
+    dsyev_(&jobz, &uplo, &k, H.data(), &k, w.data(),
+           &work_query, &lwork, &info);
+    lwork = (int)work_query;
+    std::vector<double> work(lwork);
+    dsyev_(&jobz, &uplo, &k, H.data(), &k, w.data(),
+           work.data(), &lwork, &info);
+
+    if (info != 0) {
+        fprintf(stderr, "Warning: dsyev failed in Rayleigh-Ritz refinement (info=%d)\n", info);
+        cudaFree(d_X);
+        cudaFree(d_AX);
+        return;  // keep original vectors
+    }
+
+    // Refined eigenvalues
+    memcpy(h_eigenvalues, w.data(), k * sizeof(double));
+
+    // X' = X * U  (n x k = (n x k) * (k x k))
+    double *d_U, *d_Xnew;
+    CUDA_CHECK(cudaMalloc(&d_U,    (size_t)k * k * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_Xnew, (size_t)n * k * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_U, H.data(), k * k * sizeof(double),
+        cudaMemcpyHostToDevice));
+
+    CUBLAS_CHECK(cublasDgemm(ctx.cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+        n, k, k, &one, d_X, n, d_U, k, &zero, d_Xnew, n));
+
+    CUDA_CHECK(cudaMemcpy(h_eigenvectors, d_Xnew, (size_t)n * k * sizeof(double),
+        cudaMemcpyDeviceToHost));
+
+    cudaFree(d_X);
+    cudaFree(d_AX);
+    cudaFree(d_U);
+    cudaFree(d_Xnew);
+}
+
+// Operator-based version: works with any MatVecOperator.
+// Forward declaration — MatVecOperator is defined in matvec_operator.cuh.
+struct MatVecOperator;
+
+inline void rayleigh_ritz_refine_op(LanczosContext &ctx,
+                                    MatVecOperator &op,
+                                    double *h_eigenvalues, double *h_eigenvectors,
+                                    int n, int k);  // defined after matvec_operator.cuh is included

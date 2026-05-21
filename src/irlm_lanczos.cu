@@ -8,9 +8,9 @@
  *   - Convergence checking via Ritz estimates (dsconv.f)
  *   - Dynamic NEV adjustment for anti-stagnation (dsaup2.f)
  *
- * The algorithm maintains a compact ncv-column basis (typically 3*nev)
- * and periodically compresses it back to nev columns, achieving
- * convergence with far fewer total iterations than plain Lanczos.
+ * The algorithm is parameterized on MatVecOperator, so the same code
+ * works with explicit CSR matrices, implicit operators, and spectral
+ * transformations (shift-invert).
  *
  * References:
  *   Lehoucq, Sorensen, Yang: "ARPACK Users' Guide" (1998)
@@ -18,9 +18,87 @@
  */
 
 #include "lanczos_ops.cuh"
+#include "matvec_operator.cuh"
 #include "tridiag.cuh"
 #include <vector>
 #include <algorithm>
+
+// ============================================================
+// Rayleigh-Ritz refinement (operator-based version).
+// Now that MatVecOperator is fully defined, we can implement it.
+// ============================================================
+static void rayleigh_ritz_refine_op_impl(LanczosContext &ctx,
+                                         MatVecOperator &op,
+                                         double *h_eigenvalues,
+                                         double *h_eigenvectors,
+                                         int n, int k) {
+    double one = 1.0, zero = 0.0;
+
+    double *d_X, *d_AX;
+    CUDA_CHECK(cudaMalloc(&d_X,  (size_t)n * k * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_AX, (size_t)n * k * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_X, h_eigenvectors, (size_t)n * k * sizeof(double),
+        cudaMemcpyHostToDevice));
+
+    // AX = op(X), column by column
+    for (int j = 0; j < k; j++) {
+        op.apply(ctx, d_X + (size_t)j * n, d_AX + (size_t)j * n);
+    }
+
+    // H = X^T * AX  (k x k)
+    double *d_H;
+    CUDA_CHECK(cudaMalloc(&d_H, (size_t)k * k * sizeof(double)));
+    CUBLAS_CHECK(cublasDgemm(ctx.cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+        k, k, n, &one, d_X, n, d_AX, n, &zero, d_H, k));
+
+    std::vector<double> H(k * k), w(k);
+    CUDA_CHECK(cudaMemcpy(H.data(), d_H, k * k * sizeof(double),
+        cudaMemcpyDeviceToHost));
+    cudaFree(d_H);
+
+    // dsyev: eigendecompose H
+    int lwork = -1;
+    double work_query;
+    int info;
+    char jobz = 'V', uplo = 'U';
+    dsyev_(&jobz, &uplo, &k, H.data(), &k, w.data(),
+           &work_query, &lwork, &info);
+    lwork = (int)work_query;
+    std::vector<double> work(lwork);
+    dsyev_(&jobz, &uplo, &k, H.data(), &k, w.data(),
+           work.data(), &lwork, &info);
+
+    if (info != 0) {
+        cudaFree(d_X);
+        cudaFree(d_AX);
+        return;
+    }
+
+    memcpy(h_eigenvalues, w.data(), k * sizeof(double));
+
+    // X' = X * U
+    double *d_U, *d_Xnew;
+    CUDA_CHECK(cudaMalloc(&d_U,    (size_t)k * k * sizeof(double)));
+    CUDA_CHECK(cudaMalloc(&d_Xnew, (size_t)n * k * sizeof(double)));
+    CUDA_CHECK(cudaMemcpy(d_U, H.data(), k * k * sizeof(double),
+        cudaMemcpyHostToDevice));
+
+    CUBLAS_CHECK(cublasDgemm(ctx.cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+        n, k, k, &one, d_X, n, d_U, k, &zero, d_Xnew, n));
+
+    CUDA_CHECK(cudaMemcpy(h_eigenvectors, d_Xnew, (size_t)n * k * sizeof(double),
+        cudaMemcpyDeviceToHost));
+
+    cudaFree(d_X);
+    cudaFree(d_AX);
+    cudaFree(d_U);
+    cudaFree(d_Xnew);
+}
+
+// LAPACK dsyev declaration (also used in rayleigh_ritz_refine in lanczos_ops.cuh)
+extern "C" void dsyev_(const char *jobz, const char *uplo, const int *n,
+                       double *a, const int *lda, double *w,
+                       double *work, const int *lwork, int *info);
 
 // ============================================================
 // Run Lanczos steps [start, end) with DGKS reorthogonalization.
@@ -29,18 +107,14 @@
 // beta[j] = ||r|| before normalizing v_j.
 // On exit: ctx.d_r = unnormalized residual, beta[end] = ||r||.
 // ============================================================
-static void lanczos_extend(LanczosContext &ctx, SparseMatrixCSR &A,
-                           double *d_V, int n,
-                           double *alpha, double *beta,
-                           int start, int end, int &reorth_count,
-                           bool mixed = false) {
+void lanczos_extend(LanczosContext &ctx, MatVecOperator &op,
+                    double *d_V, int n,
+                    double *alpha, double *beta,
+                    int start, int end, int &reorth_count) {
     for (int j = start; j < end; j++) {
         double *d_vj = d_V + (size_t)j * n;
 
-        if (mixed && A.descr_f32_valid)
-            spmv_mixed(ctx, A, d_vj, ctx.d_w);
-        else
-            spmv(ctx, A, d_vj, ctx.d_w);
+        op.apply(ctx, d_vj, ctx.d_w);
 
         double wnorm;
         CUBLAS_CHECK(cublasDnrm2(ctx.cublas, n, ctx.d_w, 1, &wnorm));
@@ -74,11 +148,11 @@ static void lanczos_extend(LanczosContext &ctx, SparseMatrixCSR &A,
 }
 
 // ============================================================
-// IRLM: Implicitly Restarted Lanczos Method
+// IRLM: Implicitly Restarted Lanczos Method (operator version)
 // ============================================================
-LanczosResult irlm_lanczos(LanczosContext &ctx, SparseMatrixCSR &A,
+LanczosResult irlm_lanczos(LanczosContext &ctx, MatVecOperator &op,
                            const LanczosParams &params) {
-    const int n = A.n;
+    const int n = op.n;
     const int nev_orig = params.num_eigs;
     int ncv = (params.ncv > 0) ? params.ncv
                                : std::min(std::max(3 * nev_orig, 40), n);
@@ -123,10 +197,7 @@ LanczosResult irlm_lanczos(LanczosContext &ctx, SparseMatrixCSR &A,
         cudaMemcpyHostToDevice));
 
     // Phase 1: Build initial ncv-step factorization
-    bool mixed = params.mixed_precision;
-    if (mixed) A.create_f32_copy();
-
-    lanczos_extend(ctx, A, d_V, n, alpha, beta, 0, ncv, num_reorths, mixed);
+    lanczos_extend(ctx, op, d_V, n, alpha, beta, 0, ncv, num_reorths);
     int total_steps = ncv;
 
     // Store normalized residual as column ncv (for restart)
@@ -271,8 +342,8 @@ LanczosResult irlm_lanczos(LanczosContext &ctx, SparseMatrixCSR &A,
         for (int i = nev_use + 1; i <= ncv + 1; i++) beta[i] = 0.0;
 
         // ---- Continue Lanczos from nev_use to ncv ----
-        lanczos_extend(ctx, A, d_V, n, alpha, beta,
-                       nev_use, ncv, num_reorths, mixed);
+        lanczos_extend(ctx, op, d_V, n, alpha, beta,
+                       nev_use, ncv, num_reorths);
         total_steps += (ncv - nev_use);
 
         // Store normalized residual for next restart
@@ -320,4 +391,22 @@ LanczosResult irlm_lanczos(LanczosContext &ctx, SparseMatrixCSR &A,
     ::free(alpha);
     ::free(beta);
     return res;
+}
+
+// ============================================================
+// Backward-compatible overload: accepts SparseMatrixCSR directly.
+//
+// Constructs the appropriate operator (CSR or mixed-precision)
+// and delegates to the operator-based implementation.
+// ============================================================
+LanczosResult irlm_lanczos(LanczosContext &ctx, SparseMatrixCSR &A,
+                           const LanczosParams &params) {
+    if (params.mixed_precision) {
+        A.create_f32_copy();
+        CSRMixedOperator op(A);
+        return irlm_lanczos(ctx, op, params);
+    } else {
+        CSROperator op(A);
+        return irlm_lanczos(ctx, op, params);
+    }
 }

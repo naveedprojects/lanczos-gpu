@@ -1,4 +1,77 @@
-# gpu-lanczos: ARPACK-Quality Eigenvalue Solver on GPU
+# gpu-lanczos: a Differentiable Spectral Toolkit on GPU
+
+A numerically robust GPU implementation of the **Implicitly Restarted Lanczos Method (IRLM)** with ARPACK safeguards, plus a **differentiable spectral toolkit** built on top: matrix-function application via Lanczos quadrature with Krämer-style adjoint backward, stochastic Lanczos quadrature for log-determinants, and end-to-end differentiation through arbitrary parameterised operators.
+
+The toolkit is designed to unblock graph-GP marginal-likelihood maximisation at scales where existing solutions either OOM (dense `torch.linalg.slogdet`) or misconverge (naive Lanczos quadrature, per the IMGP paper's Table-2 footnote). See [docs/PLAN.md](docs/PLAN.md) for the research narrative.
+
+## What's in here
+
+- **`gpu_eigsh.gpu_eigsh`** — drop-in replacement for `scipy.sparse.linalg.eigsh`, backed by a CUDA IRLM with DGKS reorthogonalisation, implicit restarts, mixed precision, and shift-invert. ARPACK-faithful at every scale, 53× faster at n = 10⁶.
+- **`gpu_eigsh.funm_torch`** — Lanczos-based differentiable matrix-function primitives. `funm_apply_kraemer`, `funm_qform_op`, `slq_logdet` are `torch.autograd.Function`s with custom Krämer 2024 adjoint backward.
+- **`gpu_eigsh.imgp`** — differentiable IMGP precision operator wrapper. Plug into your training loop in place of `precision_operator.inv_quad_logdet(logdet=True)[1]`.
+- **`gpu_eigsh.imgp_train`** — three reference training loops with identical data/init/optimiser, differing only in the log-det method: `imgp_train_ours` (our SLQ), `imgp_train_dense` (SS-IMGP-full row of the IMGP paper), `imgp_train_naive_lanczos` (the row of the paper's Table-2 footnote).
+
+## Differentiable spectral toolkit — what works today
+
+| Layer | API | Status |
+|---|---|---|
+| 1. `f(A)·v` forward in CUDA for f ∈ {log, exp, sqrt, inv} | `funm_apply` | ✅ machine precision vs `torch.linalg.eigh` |
+| 1b. Krämer-adjoint backward for differentiable f(A)·v | `funm_apply_kraemer` | ✅ machine-precision gradcheck (no-reortho path, m/n ≲ 0.25) |
+| 2. Stochastic Lanczos quadrature for log det A | `slq_logdet` | ✅ batched over m_probes; ∼0.2% Hutchinson noise on forward, ∼2% on gradient |
+| 3. Operator-callable autograd through matvec(x, *params) | `funm_qform_op` | ✅ machine-precision adjoint vs same-formulation autograd |
+| IMGP integration: differentiable graph-Matérn precision operator | `make_imgp_precision_matvec` | ✅ matvec matches dense reference at 1e-16; SLQ ∂(log det P)/∂(κ, θ) at ∼3e-3 vs analytic |
+
+See [docs/PLAN.md](docs/PLAN.md) and [figures/imgp_scaling.png](figures/imgp_scaling.png) for current empirical results.
+
+## Quick start
+
+Run the 60-second demo:
+
+```bash
+/usr/bin/python3 examples/quickstart_slq.py
+```
+
+This builds a parameterised sparse operator $A(\theta_1, \theta_2)$, estimates $\log\det A$ via SLQ, backpropagates, and verifies both gradients against the dense analytic ground truth (~0.3-0.6% Hutchinson noise). Then plug the same pattern into your own model:
+
+```python
+import torch
+from gpu_eigsh.funm_torch import slq_logdet
+
+# A user-defined parameterised matvec: A(θ)·x where θ are autograd-tracked tensors.
+# The matvec must accept either a 1-D vector or a 2-D (n, B) right-hand side
+# (the (n, B) form lets SLQ batch all Hutchinson probes in one matvec call).
+def my_matvec(x, theta1, theta2):
+    return theta1 * x + sparse_L @ (theta2 * x)   # any PyTorch ops
+
+theta1 = torch.tensor(1.5, requires_grad=True, device="cuda")
+theta2 = torch.tensor(0.7, requires_grad=True, device="cuda")
+
+# log det A(θ) by stochastic Lanczos quadrature, differentiable end-to-end.
+logdet = slq_logdet(
+    my_matvec, n=1_000_000, params=(theta1, theta2),
+    m_probes=20, lanczos_m=15, seed=0,
+    dtype=torch.float32, device="cuda",
+)
+logdet.backward()
+# theta1.grad, theta2.grad are now populated.
+```
+
+**Demonstrated scale: N = 10⁶ on a 16 GB GPU in ~90 seconds for a full training run.**
+
+For IMGP-style graph-Matérn GPs see `gpu_eigsh.imgp.make_imgp_precision_matvec` and [benchmark/imgp_demo.py](benchmark/imgp_demo.py). The full scaling story (dense baseline OOMs past N = 2000; naive Lanczos diverges past N = 500 000; ours scales to N = 10⁶) is reproducible via:
+
+```bash
+/usr/bin/python3 benchmark/imgp_scaling_sweep.py \
+        --ns 500 2000 5000 10000 50000 100000 500000 1000000 \
+        --max-n-full 2000 --device cuda --dtype float32 \
+        --synthetic-threshold 100000
+/usr/bin/python3 benchmark/plot_imgp_scaling.py
+# → figures/imgp_scaling.png
+```
+
+---
+
+## Foundational layer: ARPACK-quality GPU IRLM
 
 A numerically robust GPU implementation of the **Implicitly Restarted Lanczos Method (IRLM)**, faithfully porting the numerical safeguards from ARPACK to CUDA.
 
