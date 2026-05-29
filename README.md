@@ -2,7 +2,7 @@
 
 A numerically robust GPU implementation of the **Implicitly Restarted Lanczos Method (IRLM)** with ARPACK safeguards, plus a **differentiable spectral toolkit** built on top: matrix-function application via Lanczos quadrature with Krämer-style adjoint backward, stochastic Lanczos quadrature for log-determinants, and end-to-end differentiation through arbitrary parameterised operators.
 
-The toolkit is designed to unblock graph-GP marginal-likelihood maximisation at scales where existing solutions either OOM (dense `torch.linalg.slogdet`) or misconverge (naive Lanczos quadrature, per the IMGP paper's Table-2 footnote). See [docs/PLAN.md](docs/PLAN.md) for the research narrative.
+The toolkit is designed to unblock graph-GP marginal-likelihood maximisation at scales where existing solutions either OOM (dense `torch.linalg.slogdet`) or misconverge (naive Lanczos quadrature) for large sparse operators.
 
 ## What's in here
 
@@ -55,8 +55,6 @@ Reproduce with:
         --synthetic-threshold 100000
 /usr/bin/python3 benchmark/plot_imgp_scaling.py
 ```
-
-See [docs/PLAN.md](docs/PLAN.md) for the research narrative and [docs/WRITEUP.md](docs/WRITEUP.md) for the technical writeup.
 
 ## Quick start
 
